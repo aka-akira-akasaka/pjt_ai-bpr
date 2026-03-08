@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI-BPR</title>
+  <style>
+    body { font-family: sans-serif; width: 280px; padding: 12px; font-size: 13px; }
+    h1 { font-size: 15px; margin: 0 0 8px; }
+    #status { color: #666; margin-bottom: 8px; }
+    button { padding: 6px 12px; cursor: pointer; margin-right: 6px; }
+    #count { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>AI-BPR Watcher</h1>
+  <p id="status">収集中のイベント数: <span id="count">0</span></p>
+  <button id="btn-export">イベントをエクスポート</button>
+  <button id="btn-clear">クリア</button>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>
