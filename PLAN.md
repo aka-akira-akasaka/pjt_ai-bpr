@@ -1,266 +1,364 @@
-# pjt_ai-bpr 実装計画
+# pjt_ai-bpr 実装計画（SaaS版）
 
 最終更新: 2026-03-08
 
 ---
 
-## 1. プロジェクト全体像
+## 1. プロダクト概要・SaaS方針
 
-### パイプライン概要
+### 核心的な価値
 
-```
-[画面/操作] → watcher → analyzer → ai-engine → dashboard（承認） → automation → [実行結果]
-                  ↑                                                        ↓
-                  └──────────────── フィードバックループ ──────────────────┘
-```
+ユーザーは何も操作しない。Chrome拡張機能をインストールするだけで、
+業務がバックグラウンドで分析され、自動化提案が届き、承認するだけで自動化される。
 
-### 設計原則
+### 初期ターゲット
 
-- ユーザーは何も操作しない。バックグラウンドで自律的に動く
-- 破壊的操作は必ずユーザー承認を経由する（automation のドライラン原則）
-- 各モジュールは疎結合。イベントバスを通じてのみ通信する
-- セキュリティファースト: 画面データはメモリ上のみ、外部送信前に必ず匿名化
+- **対象業務**: Webブラウザ（Chrome）上で行われるすべての業務
+- **典型的なユースケース**: SalesforceへのデータCopy&Paste、スプレッドシートとWebツール間の転記、フォーム入力の繰り返し作業
+- **ターゲット顧客**: SaaSツールを多用している中小〜中堅企業
+
+### 課金モデル
+
+- **自動化実行数ベース**: 1実行 = 1カウント（月次集計、超過従量制）
+- プラン例: Starter（100回/月）/ Growth（1,000回/月）/ Enterprise（無制限＋SLA）
 
 ---
 
-## 2. 技術選定
+## 2. アーキテクチャ全体像
 
-### 言語・ランタイムの使い分け
+### コンポーネント構成
 
-| モジュール | 言語 | 理由 |
+```
+【顧客側】
+Chrome Extension（watcher + executor）
+  │  ① 操作イベントを匿名化して送信（HTTPS）
+  │  ④ 承認済みスクリプトを受信してローカル実行
+  ▼
+【クラウド側（マルチテナントSaaS）】
+┌─────────────────────────────────────────┐
+│  API Gateway（認証・レート制限・テナントルーティング）  │
+├──────────────┬──────────────┬───────────┤
+│  analyzer    │  ai-engine   │ automation│
+│  (Python)    │  (Node.js)   │ (Node.js) │
+│  パターン分析 │  Claude API  │スクリプト生成│
+│  フロー抽出  │  提案生成    │           │
+├──────────────┴──────────────┴───────────┤
+│  dashboard（React Web App）              │
+│  ② フロー・提案の可視化  ③ 承認操作      │
+├─────────────────────────────────────────┤
+│  データ層（PostgreSQL + Row Level Security）│
+│  ストレージ（S3 / GCS、テナント別暗号化）  │
+│  キュー（SQS / Cloud Tasks）             │
+└─────────────────────────────────────────┘
+```
+
+### データフロー
+
+```
+Extension（操作キャプチャ）
+  └─[HTTPS: CaptureEvent]─→ API Gateway
+                               └─[Queue]─→ analyzer
+                                              └─[Unix Socket]─→ ai-engine
+                                                                   └─[WebSocket]─→ dashboard（承認待ち）
+                                                                                       └─[承認]─→ automation
+                                                                                                    └─[WebSocket]─→ Extension（スクリプト実行）
+                                                                                                                       └─[実行結果]─→ API Gateway（課金カウント）
+```
+
+### Extensionがexecutorを兼ねる理由
+
+- 顧客の認証済みChromeセッションをそのまま利用できる
+- SaaSツール（Salesforce・Notion・Googleなど）へのログイン情報をクラウドに保存しなくて済む
+- Extension内でスクリプトを実行するため、企業のセキュリティポリシーに適合しやすい
+
+---
+
+## 3. マルチテナント設計
+
+### テナント分離戦略
+
+| レイヤー | 分離方式 | 理由 |
 |---|---|---|
-| watcher | Node.js (TypeScript) | Electronとの親和性、OS APIへのバインディングが充実 |
-| analyzer | Python | NumPy/PIL による画像処理、scikit-learn によるパターン分析 |
-| ai-engine | Node.js (TypeScript) | Claude API SDK が TypeScript ファースト、型安全なプロンプト管理 |
-| automation | Node.js (TypeScript) | Playwright が TypeScript ネイティブ |
-| dashboard | Node.js (TypeScript) + React | Electron レンダラーと統合、リアルタイム更新に適合 |
+| DB | Row Level Security（テナントID列） | コスト効率とセキュリティのバランス |
+| ストレージ | テナントIDプレフィックス + 個別KMS鍵 | データが混在しない |
+| AI API呼び出し | テナント別使用量追跡 | 課金計算・レート制限に使用 |
+| キュー | テナント別キュー（大口）or メタデータフィルタ（小口） | 大口顧客の処理優先度確保 |
 
-### モジュール間通信
+### テナントデータモデル
 
-- watcher → analyzer: gRPC（バイナリ画像データの効率的転送）
-- analyzer → ai-engine: JSON over Unix Socket（同一ホスト前提）
-- ai-engine → dashboard: WebSocket（リアルタイム提案通知）
-- dashboard → automation: REST API（承認イベントのトリガー）
+```sql
+-- すべてのテーブルに tenant_id を持ち RLS で分離
+CREATE TABLE tenants (
+  id          UUID PRIMARY KEY,
+  name        TEXT NOT NULL,
+  plan        TEXT NOT NULL,  -- 'starter' | 'growth' | 'enterprise'
+  created_at  TIMESTAMPTZ
+);
 
-### 主要依存パッケージ
+CREATE TABLE users (
+  id          UUID PRIMARY KEY,
+  tenant_id   UUID REFERENCES tenants(id),
+  email       TEXT NOT NULL,
+  role        TEXT NOT NULL   -- 'admin' | 'member' | 'viewer'
+);
 
-| パッケージ | 用途 |
-|---|---|
-| `@anthropic-ai/sdk` | Claude API クライアント |
-| `playwright` | ブラウザ自動化 |
-| `electron` | デスクトップアプリ基盤 |
-| `sharp` | 画像差分検出・前処理 |
-| `grpc-js` | watcher-analyzer 間通信 |
-| `socket.io` | dashboard リアルタイム通信 |
+CREATE TABLE business_flows (
+  id              UUID PRIMARY KEY,
+  tenant_id       UUID REFERENCES tenants(id),
+  name            TEXT,
+  frequency       INT,
+  confidence      FLOAT,
+  created_at      TIMESTAMPTZ
+);
+
+CREATE TABLE automation_proposals (
+  id                UUID PRIMARY KEY,
+  tenant_id         UUID REFERENCES tenants(id),
+  flow_id           UUID REFERENCES business_flows(id),
+  title             TEXT,
+  draft_script      TEXT,   -- 暗号化保存
+  status            TEXT,   -- 'pending' | 'approved' | 'rejected' | 'executing'
+  approved_by       UUID REFERENCES users(id),
+  approved_at       TIMESTAMPTZ
+);
+
+CREATE TABLE execution_logs (
+  id              UUID PRIMARY KEY,
+  tenant_id       UUID REFERENCES tenants(id),
+  proposal_id     UUID REFERENCES automation_proposals(id),
+  executed_at     TIMESTAMPTZ,
+  success         BOOLEAN,
+  duration_ms     INT
+);
+
+-- Row Level Security 設定例
+ALTER TABLE business_flows ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON business_flows
+  USING (tenant_id = current_setting('app.tenant_id')::UUID);
+```
+
+### 使用量計測・課金
+
+```
+execution_logs テーブル → 月次集計 → billing_usage テーブル
+                                            └─→ Stripe API（請求）
+```
 
 ---
 
-## 3. モジュール責務・インターフェース設計
+## 4. モジュール設計
 
-### 3.1 watcher（Node.js / TypeScript）
+### 4.1 Chrome Extension（watcher + executor）
 
-**責務**: 画面キャプチャとユーザー操作ログの収集
+**責務**: 操作イベントのキャプチャ / 承認済みスクリプトのローカル実行
 
-**ディレクトリ構成**
+**構成**
 
 ```
-watcher/
-├── index.ts              # エントリポイント、キャプチャループ管理
-├── capture/
-│   ├── screen.ts         # OS ネイティブスクリーンショット
-│   └── diff.ts           # フレーム差分検出（変化なしはスキップ）
-├── events/
-│   ├── mouse.ts          # マウス操作ログ
-│   └── keyboard.ts       # キーボード操作ログ（パスワード除外付き）
-├── privacy/
-│   └── filter.ts         # 機密フィールド除外ロジック
-└── transport/
-    └── grpc-client.ts    # analyzer への送信
+extension/
+├── manifest.json         # Chrome Extension Manifest V3
+├── background/
+│   ├── service-worker.ts # イベント送信・WebSocket接続管理
+│   └── api-client.ts     # クラウドAPIとの通信
+├── content/
+│   ├── watcher.ts        # DOM操作イベントの収集
+│   ├── privacy-filter.ts # 機密フィールド除外（input[type=password]等）
+│   └── executor.ts       # 承認済みスクリプトの実行エンジン
+├── popup/
+│   └── App.tsx           # ステータス確認・ON/OFFトグル
+└── utils/
+    └── anonymizer.ts     # 個人情報マスキング（送信前）
 ```
 
-**公開インターフェース**
+**キャプチャするイベント**
 
 ```typescript
 interface CaptureEvent {
+  sessionId: string;       // テナントID + ランダムセッションID
   timestamp: number;
-  type: 'screenshot' | 'mouse' | 'keyboard';
-  payload: ScreenshotPayload | MousePayload | KeyboardPayload;
-  sessionId: string;  // ユーザー識別子は含まない
-}
-
-interface ScreenshotPayload {
-  imageBuffer: Buffer;  // PNG バイナリ（ディスクに書かない）
-  activeWindow: string;
-  diff: number;         // 前フレームからの差分率 0.0-1.0
+  url: string;             // originのみ（パス・クエリはマスク）
+  eventType: 'click' | 'input' | 'navigation' | 'copy' | 'paste';
+  targetSelector: string;  // DOMセレクタ（個人情報除外済み）
+  value?: string;          // input値（匿名化済み）
 }
 ```
 
-**セキュリティ制約**
+**スクリプト実行（executor）**
 
-- `filter.ts` でパスワードマネージャー・銀行サイト・input[type=password] の領域をブラックアウト
-- キャプチャ間隔: デフォルト 500ms（設定可変）
-- 差分率 5% 未満のフレームは送信しない
+- クラウドから受け取るのは「Playwright互換のDOM操作命令リスト（JSON）」
+- Extensionが `chrome.debugger` API を使用してChrome DevTools Protocolで実行
+- 実行前に必ずダイアログで「何をするか」をユーザーに表示し確認
+
+**セキュリティ**
+
+- `privacy-filter.ts` でパスワードフィールド・クレカ番号フィールドをキャプチャ除外
+- URLはoriginのみ送信（`https://app.salesforce.com` のように）
+- スクリプト実行は承認済みのプロポーザルIDとHMACで署名確認
 
 ---
 
-### 3.2 analyzer（Python）
+### 4.2 API Gateway / Backend（Node.js / TypeScript）
 
-**責務**: キャプチャイベントから業務パターンを抽出しフローを構造化
+**責務**: 認証・テナントルーティング・レート制限・WebSocket管理
 
-**ディレクトリ構成**
+**構成**
+
+```
+backend/
+├── index.ts
+├── auth/
+│   ├── jwt.ts            # JWT検証（Auth0 / Supabase Auth）
+│   └── tenant.ts         # テナントコンテキストの解決
+├── routes/
+│   ├── events.ts         # POST /events（Extensionからの受信）
+│   ├── proposals.ts      # GET/PATCH /proposals（ダッシュボード用）
+│   ├── executions.ts     # POST /executions（実行トリガー）
+│   └── billing.ts        # GET /usage（使用量確認）
+├── ws/
+│   └── gateway.ts        # WebSocket（リアルタイム提案通知・実行指示）
+├── queue/
+│   └── publisher.ts      # SQS/Cloud Tasks へのエンキュー
+└── middleware/
+    ├── rate-limit.ts     # テナント別レート制限
+    └── usage-meter.ts    # 実行カウント記録
+```
+
+**APIエンドポイント設計**
+
+```
+POST   /api/v1/events              # Extension → イベント送信
+GET    /api/v1/flows               # ダッシュボード → フロー一覧
+GET    /api/v1/proposals           # ダッシュボード → 提案一覧
+PATCH  /api/v1/proposals/:id       # ダッシュボード → 承認/却下
+POST   /api/v1/proposals/:id/execute # 実行トリガー
+GET    /api/v1/usage               # 使用量確認
+WS     /ws                         # リアルタイム通知
+```
+
+---
+
+### 4.3 analyzer（Python）
+
+**責務**: キャプチャイベントから繰り返し業務フローを抽出
+
+**構成**
 
 ```
 analyzer/
-├── main.py               # gRPC サーバー、イベント受信
-├── vision/
-│   ├── ocr.py            # 画面テキスト抽出（Tesseract / Vision API）
-│   └── ui_detector.py    # ボタン・フォーム・テーブル検出
+├── main.py               # Workerプロセス（キューから消費）
 ├── patterns/
-│   ├── sequence.py       # 操作シーケンスのパターンマイニング
-│   └── flow_extractor.py # 繰り返し業務フローの抽出
-├── anonymizer.py         # 個人情報・機密情報のマスキング
-└── schema/
-    └── flow.py           # BusinessFlow データクラス
+│   ├── sequence.py       # スライディングウィンドウでパターンマイニング
+│   └── flow_extractor.py # 繰り返し3回以上をBusinessFlow候補に
+├── schema/
+│   └── flow.py           # BusinessFlowデータクラス
+└── anonymizer.py         # 2次匿名化（念のため二重チェック）
 ```
 
-**公開インターフェース（出力スキーマ）**
+**出力スキーマ**
 
 ```python
 @dataclass
 class BusinessFlow:
     flow_id: str
-    name: str                      # 例: "受注データをExcelに転記"
-    frequency: int                 # 検出された繰り返し回数
+    tenant_id: str
+    name: str                      # 例: "Salesforceの商談データをスプレッドシートに転記"
+    frequency: int                 # 検出した繰り返し回数
     steps: list[FlowStep]
+    target_services: list[str]     # ["salesforce.com", "docs.google.com"]
     estimated_time_per_run: float  # 秒
     confidence: float              # 0.0-1.0
 
 @dataclass
 class FlowStep:
     order: int
-    action_type: str               # "click" | "type" | "navigate" | "copy_paste"
-    target_app: str                # "Excel" | "Chrome" | "Outlook" など
-    description: str               # 匿名化済みの操作説明
+    action_type: str               # "click" | "input" | "copy" | "paste" | "navigate"
+    service: str                   # "salesforce.com"
+    description: str               # 匿名化済みの説明
+    selector_hint: str             # DOM操作のヒント情報
 ```
-
-**処理フロー**
-
-1. OCR でテキスト抽出 → anonymizer で個人情報マスク
-2. 操作シーケンスをスライディングウィンドウでパターンマイニング
-3. 繰り返し頻度 3 回以上を BusinessFlow 候補として抽出
-4. confidence スコアと共に ai-engine へ送信
 
 ---
 
-### 3.3 ai-engine（Node.js / TypeScript）
+### 4.4 ai-engine（Node.js / TypeScript）
 
-**責務**: BusinessFlow を受け取り、AI 化・自動化の提案を生成する
+**責務**: BusinessFlowを受け取り、自動化提案とChrome操作スクリプトを生成
 
-**ディレクトリ構成**
+**構成**
 
 ```
 ai-engine/
-├── client.ts             # Claude API の唯一の窓口（全モジュールここを経由）
-├── proposer.ts           # BusinessFlow → AutomationProposal の変換
+├── client.ts             # Claude API 唯一の入口（モデル自動切替）
+├── proposer.ts           # BusinessFlow → AutomationProposal 変換
+├── script-generator.ts  # 自動化スクリプト（CDP命令JSON）生成
 ├── prompts/
-│   ├── flow_analysis.md  # フロー分析プロンプト（sonnet-4-6 用）
-│   └── code_generation.md # 自動化コード生成プロンプト（opus-4-6 用）
+│   ├── flow_analysis.md  # sonnet-4-6用: フロー分析・提案生成
+│   └── script_gen.md     # opus-4-6用: Chrome操作スクリプト生成
 └── schema/
-    └── proposal.ts       # AutomationProposal 型定義
+    └── proposal.ts
 ```
 
-**公開インターフェース**
+**AutomationProposalスキーマ**
 
 ```typescript
 interface AutomationProposal {
   proposalId: string;
+  tenantId: string;
   sourceFlowId: string;
   title: string;
   description: string;
   estimatedTimeSaving: number;  // 週あたり節約時間（分）
-  automationType: 'playwright' | 'api_integration' | 'macro';
-  draftCode: string;            // Playwright スクリプト等
-  risks: string[];              // リスク一覧
+  targetServices: string[];     // ["salesforce.com", "docs.google.com"]
+  script: CDPScript;            // Chrome操作命令リスト
+  risks: string[];
   status: 'pending_approval' | 'approved' | 'rejected' | 'executing';
+}
+
+// Extensionのexecutorが解釈するChrome操作命令
+interface CDPScript {
+  version: string;
+  steps: CDPStep[];
+}
+
+interface CDPStep {
+  action: 'navigate' | 'click' | 'type' | 'wait' | 'extract' | 'assert';
+  selector?: string;
+  value?: string;
+  url?: string;
+  description: string;  // ユーザーへの説明（確認ダイアログ表示用）
 }
 ```
 
 **Claude API モデル使い分け**
 
-- `client.ts` で `purpose` パラメータを受け取り自動切替
-- `purpose: 'analyze'` → `claude-sonnet-4-6`（BusinessFlow 全体把握）
-- `purpose: 'generate'` → `claude-opus-4-6`（自動化コード生成）
-
-**セキュリティ**
-
-- `client.ts` 内で送信前に `anonymizer` を通す
-- システムプロンプトは `prompts/` の .md ファイルから読み込み（ハードコード禁止）
+| purpose | モデル | 用途 |
+|---|---|---|
+| `'analyze'` | `claude-sonnet-4-6` | フロー全体把握・提案タイトル・リスク抽出 |
+| `'generate'` | `claude-opus-4-6` | CDPスクリプト生成（高精度コード生成が必要）|
 
 ---
 
-### 3.4 automation（Node.js / TypeScript）
+### 4.5 dashboard（React Web App）
 
-**責務**: 承認済み AutomationProposal の実行
+**責務**: 提案の承認UI、実行状況の可視化、使用量・課金確認
 
-**ディレクトリ構成**
-
-```
-automation/
-├── executor.ts           # 提案を受け取り実行管理
-├── runners/
-│   ├── playwright.ts     # Playwright ブラウザ自動化
-│   └── os_action.ts      # キーボード・クリップボード操作
-├── sandbox/
-│   └── dry_run.ts        # ドライラン（実際の副作用なし）
-└── audit_log.ts          # 実行ログ（暗号化保存）
-```
-
-**実行原則**
-
-1. 必ず dry_run を先行実行し、想定外の操作がないか確認
-2. 破壊的操作（POST/DELETE/ファイル送信）はダッシュボードで再確認
-3. audit_log に操作内容・日時・成否を記録（平文禁止、AES-256）
-
----
-
-### 3.5 dashboard（React + Electron）
-
-**責務**: 提案の承認UI・実行状況の可視化
-
-**ディレクトリ構成**
+**構成**
 
 ```
 dashboard/
-├── electron/
-│   └── main.ts           # Electron メインプロセス
 ├── src/
 │   ├── App.tsx
 │   ├── pages/
-│   │   ├── Proposals.tsx  # 承認待ち提案一覧
-│   │   ├── FlowViewer.tsx # 検出された業務フロー可視化
-│   │   └── AuditLog.tsx   # 実行履歴
-│   └── api/
-│       └── socket.ts      # WebSocket 接続（ai-engine から受信）
+│   │   ├── Proposals.tsx    # 承認待ち提案一覧（メイン画面）
+│   │   ├── FlowViewer.tsx   # 検出された業務フロー一覧・詳細
+│   │   ├── ExecutionLog.tsx # 実行履歴・成功率
+│   │   └── Usage.tsx        # 使用量・課金状況
+│   ├── components/
+│   │   ├── ProposalCard.tsx  # 提案カード（承認/却下ボタン付き）
+│   │   └── ScriptPreview.tsx # 実行されるスクリプトの可読プレビュー
+│   └── hooks/
+│       └── useWebSocket.ts  # リアルタイム提案通知
 └── package.json
 ```
-
----
-
-## 4. データフロー設計
-
-```
-watcher
-  └─[gRPC: CaptureEvent]─→ analyzer
-                               └─[Unix Socket: BusinessFlow]─→ ai-engine
-                                                                   └─[WebSocket: AutomationProposal]─→ dashboard
-                                                                                                           └─[REST: approved ProposalId]─→ automation
-                                                                                                                                               └─[audit log]
-```
-
-### イベントバスの代替案（将来検討）
-
-- 現状: 直接 gRPC / Socket 通信（シンプルさ優先）
-- 将来: Redis Streams or NATS JetStream（スケールアウト時）
 
 ---
 
@@ -268,117 +366,147 @@ watcher
 
 ### データ分類と処理ルール
 
-| データ種別 | 保存 | 外部送信 | 処理場所 |
+| データ種別 | 処理場所 | 保存 | 外部送信 |
 |---|---|---|---|
-| スクリーンショット | 禁止（メモリのみ） | 匿名化後のみ | watcher → analyzer |
-| 操作ログ（テキスト） | 暗号化のみ | 匿名化後のみ | watcher |
-| 抽出業務フロー | 可（匿名化済み） | 可（匿名化済み） | analyzer |
-| 自動化コード | 可 | AI API のみ | ai-engine |
-| 実行ログ | AES-256 暗号化 | 不可 | automation |
+| 生の画面内容・入力値 | Extensionのみ（クラウド送信禁止） | 禁止 | 禁止 |
+| 匿名化済み操作イベント | Extension → Cloud | DBに保存（テナント別暗号化） | Claudeに送信可 |
+| 抽出業務フロー | Cloud | DB（匿名化済み） | Claude API |
+| 自動化スクリプト | Cloud生成 → Extension実行 | DB（暗号化） | Extension |
+| 実行ログ | Cloud | DB（暗号化） | 不可 |
 
-### 匿名化処理の対象
+### 匿名化処理（Extension側）
 
-- 氏名・メールアドレス・電話番号 → `[PERSON]` `[EMAIL]` `[PHONE]` に置換
-- URLのクエリパラメータ → `?[MASKED]` に置換
-- パスワード入力フィールド → キャプチャ対象から除外
+- パスワード・クレカ番号フィールド → キャプチャ除外
+- URLクエリパラメータ → `?[MASKED]` に置換
+- 入力値（テキスト） → カテゴリタグに変換（例: "田中太郎" → `[PERSON_NAME]`）
+- URLはoriginのみ（`https://app.salesforce.com`）
 
-### 実装で必ず入れるガードレール
+### スクリプト実行のセキュリティ
 
-- `watcher/privacy/filter.ts`: キャプチャ前フィルタ
-- `analyzer/anonymizer.py`: テキスト抽出後の即時マスキング
-- `ai-engine/client.ts`: Claude API 送信直前の最終確認
-
----
-
-## 6. 実装ロードマップ
-
-### Phase 1: MVP（2週間）
-
-**目標**: watcher → analyzer → ai-engine の最小パイプラインを手動トリガーで動作させる
-
-| タスク | モジュール | 優先度 |
-|---|---|---|
-| スクリーンショット取得（1枚） | watcher | 高 |
-| OCR でテキスト抽出 | analyzer | 高 |
-| 抽出テキストを Claude に送り業務説明を生成 | ai-engine | 高 |
-| CLI で結果確認できる | - | 高 |
-| 差分検出によるフレームスキップ | watcher | 中 |
-| 匿名化処理（基本） | analyzer | 高 |
-
-**MVP の成功基準**
-
-- 任意の画面キャプチャから「この画面で何をしているか」の説明が自動生成される
-- 個人情報が Claude に送信されていないことが確認できる
+- クラウドから受け取るスクリプトは `proposalId + tenantId` のHMACで署名検証
+- 実行前に必ず確認ダイアログ（何をするか可読テキストで表示）
+- 外部ドメインへの予期しないnavigate命令は自動ブロック
 
 ---
 
-### Phase 2: パターン検出（2週間）
+## 6. インフラ設計
 
-**目標**: 繰り返し操作から BusinessFlow を自動抽出する
+### 推奨構成（初期〜中期）
 
-| タスク | モジュール |
-|---|---|
-| 操作シーケンスのロギング | watcher |
-| パターンマイニング実装 | analyzer |
-| BusinessFlow スキーマの確定 | analyzer |
-| ai-engine への BusinessFlow 送信 | analyzer |
-| AutomationProposal の生成 | ai-engine |
+```
+Vercel / Railway
+├── backend（Node.js）    ← API Gateway + WebSocket
+├── analyzer（Python）    ← Worker
+├── ai-engine（Node.js）  ← Worker
+└── dashboard（React）    ← Static
 
----
+Supabase
+├── PostgreSQL + RLS
+└── Auth（JWT発行）
 
-### Phase 3: 承認フロー・実行（2週間）
+AWS SQS / Google Cloud Tasks
+└── 非同期ジョブキュー
 
-**目標**: ダッシュボードで提案を承認し、Playwright で自動実行する
-
-| タスク | モジュール |
-|---|---|
-| dashboard の基本 UI | dashboard |
-| WebSocket で提案をリアルタイム表示 | dashboard, ai-engine |
-| 承認 → automation へのトリガー | dashboard, automation |
-| Playwright ドライラン実装 | automation |
-| audit_log 実装 | automation |
-
----
-
-### Phase 4: 品質・セキュリティ強化（継続）
-
-- E2E テストのサンドボックス化
-- 暗号化ログの実装
-- UI の改善とフィードバックループ
-
----
-
-## 7. 開発の始め方
-
-### 最初に作るファイル（Phase 1 開始順）
-
-1. `watcher/capture/screen.ts` - OS スクリーンショット取得
-2. `watcher/privacy/filter.ts` - 機密フィールド除外
-3. `analyzer/vision/ocr.py` - Tesseract OCR 呼び出し
-4. `analyzer/anonymizer.py` - 個人情報マスキング
-5. `ai-engine/client.ts` - Claude API クライアント（全 API コールの唯一の入口）
-6. `ai-engine/prompts/flow_analysis.md` - 分析プロンプト
-
-### パッケージ初期化コマンド
-
-```bash
-# watcher, ai-engine, automation, dashboard
-cd watcher && npm init -y && npm install typescript @types/node
-
-# analyzer
-cd analyzer && python -m venv .venv && pip install pytesseract Pillow grpcio
-
-# ai-engine
-cd ai-engine && npm install @anthropic-ai/sdk
+Stripe
+└── 課金・使用量管理
 ```
 
+### スケールアップ時の移行先
+
+- コンテナオーケストレーション: Kubernetes（GKE/EKS）
+- キュー: NATS JetStream（より高スループット）
+- ストレージ: S3 + テナント別KMSキー
+
 ---
 
-## 8. 未解決の技術的判断事項
+## 7. 実装ロードマップ
 
-以下は実装開始前に決定が必要な事項:
+### Phase 1: ローカル検証MVP（2週間）
 
-1. **OCR エンジン選定**: Tesseract（ローカル・無料）vs Google Vision API（高精度・有料）
-   - 推奨: Phase 1 は Tesseract で始め、精度不足であれば Vision API に切替
-2. **Electron vs ブラウザ拡張機能**: 全画面監視が必要なため Electron が第一候補
-3. **gRPC の採用判断**: Phase 1 は単純な HTTP/JSON でも可。画像データ量が増えてから gRPC に移行する選択肢もある
+**目標**: Chrome ExtensionでChromeの操作を収集 → Claudeが業務説明を返す
+
+| タスク | 担当モジュール |
+|---|---|
+| Chrome Extension（Manifest V3）の骨格作成 | extension |
+| DOM操作イベントのキャプチャ（click/input） | extension/content/watcher.ts |
+| 匿名化フィルター（パスワード除外・URL加工） | extension/utils/anonymizer.ts |
+| Claude APIクライアント（client.ts）実装 | ai-engine |
+| キャプチャデータを送りClaude解説を返すCLI | ai-engine |
+
+**成功基準**: ExtensionをインストールしたChromeでSalesforceを操作すると、「この操作の説明」が返ってくる
+
+---
+
+### Phase 2: クラウドバックエンド + パターン検出（3週間）
+
+**目標**: マルチテナントAPIを立て、繰り返し操作からBusinessFlowを自動抽出する
+
+| タスク | 担当モジュール |
+|---|---|
+| Supabase（PostgreSQL + Auth）セットアップ | infra |
+| テナントデータモデルの実装（RLS設定） | infra |
+| API Gateway実装（認証・イベント受信） | backend |
+| パターンマイニング実装 | analyzer |
+| BusinessFlow → AutomationProposal生成 | ai-engine |
+| Extensionをクラウド接続に対応 | extension |
+
+---
+
+### Phase 3: 承認フロー + スクリプト実行（2週間）
+
+**目標**: ダッシュボードで提案を承認し、Extensionがスクリプトを実行する
+
+| タスク | 担当モジュール |
+|---|---|
+| CDPスクリプト生成プロンプト実装 | ai-engine |
+| Extension executor実装（CDPスクリプト実行） | extension/content/executor.ts |
+| 実行前確認ダイアログ実装 | extension |
+| dashboard基本UI（提案一覧・承認ボタン） | dashboard |
+| WebSocketリアルタイム通知 | backend, dashboard |
+| 実行ログ記録 | backend |
+
+---
+
+### Phase 4: 課金・マーケット投入（2週間）
+
+**目標**: 課金フローを完成させ、Chrome Web Storeに公開できる状態にする
+
+| タスク | 担当モジュール |
+|---|---|
+| Stripe連携（使用量ベース課金） | backend/billing |
+| 使用量ダッシュボード | dashboard/Usage.tsx |
+| テナントオンボーディングフロー | dashboard, backend |
+| Chrome Web Storeへの申請準備 | extension |
+| セキュリティ監査・ペネトレーションテスト | 全体 |
+
+---
+
+## 8. 技術的判断事項（未確定）
+
+| 事項 | 推奨案 | 理由 |
+|---|---|---|
+| ExtensionのChrome操作API | `chrome.debugger` API | CDP直アクセスでPlaywright相当の操作が可能 |
+| 認証基盤 | Supabase Auth | PostgreSQLとの統合が容易、RLS設定が自然 |
+| バックエンドホスティング初期 | Railway or Render | 小規模から始めやすい、Docker対応 |
+| OCR不要化 | DOM直接読み取りで代替 | Chrome ExtensionはDOMに直接アクセスできるためOCR不要 |
+| テナントDB分離レベル | RLS（共有DB）で開始 | 初期フェーズはコスト優先。Enterpriseプランは個別スキーマ検討 |
+
+---
+
+## 9. 開発の始め方（Phase 1 開始順）
+
+```bash
+# 1. Extension の骨格
+mkdir -p extension/background extension/content extension/popup extension/utils
+cd extension && npm init -y && npm install typescript @types/chrome
+
+# 2. ai-engine のセットアップ
+mkdir -p ai-engine/prompts
+cd ai-engine && npm init -y && npm install @anthropic-ai/sdk typescript
+
+# 3. 最初に作るファイル
+# extension/content/watcher.ts         - DOMイベントキャプチャ
+# extension/utils/anonymizer.ts        - 匿名化
+# ai-engine/client.ts                  - Claude API唯一の入口
+# ai-engine/prompts/flow_analysis.md   - 分析プロンプト
+```
